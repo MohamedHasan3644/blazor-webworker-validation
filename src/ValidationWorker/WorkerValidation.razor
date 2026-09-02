@@ -1,0 +1,510 @@
+@using System.Diagnostics
+@using Microsoft.AspNetCore.Components.Web
+@using Microsoft.JSInterop
+@inject IJSRuntime JSRuntime
+@inject NavigationManager Navigation
+@implements IAsyncDisposable
+
+<section class="validation-console" data-testid="validation-console">
+    <header class="console-header">
+        <div>
+            <p class="eyebrow">@ConfigurationName</p>
+            <h1>Web worker cancellation lab</h1>
+        </div>
+        <div class="runtime-status" aria-live="polite">
+            <span class="status-dot @(client is null ? "offline" : "online")"></span>
+            <span data-testid="client-status">@(client is null ? "No client" : "Client ready")</span>
+            <span class="runtime-label" data-testid="runtime-location">@RuntimeLocation</span>
+        </div>
+    </header>
+
+    <div class="control-band">
+        <fieldset>
+            <legend>Worker creation</legend>
+            <label for="creation-timeout">Timeout (ms)</label>
+            <input id="creation-timeout" data-testid="creation-timeout" type="number" min="0" step="50" @bind="creationTimeoutMs" />
+            <div class="button-row">
+                <button class="btn btn-primary" data-testid="create-client" @onclick="CreateClientAsync" disabled="@(client is not null)">Create client</button>
+                <button class="btn btn-outline-secondary" data-testid="pre-cancel-create" @onclick="CreateWithPreCancelledTokenAsync">Pre-cancel creation</button>
+                <button class="btn btn-outline-danger" data-testid="dispose-client" @onclick='() => DisposeClientAsync("Manual disposal")' disabled="@(client is null)">Dispose</button>
+            </div>
+        </fieldset>
+
+        <fieldset>
+            <legend>Invocation</legend>
+            <div class="field-grid">
+                <div>
+                    <label for="method">Method</label>
+                    <select id="method" data-testid="method" @bind="selectedMethod">
+                        <option value="Fast">Fast</option>
+                        <option value="Slow">Slow</option>
+                        <option value="Never">Never returns</option>
+                        <option value="Fail">Ordinary failure</option>
+                    </select>
+                </div>
+                <div>
+                    <label for="invocation-timeout">Timeout (ms)</label>
+                    <input id="invocation-timeout" data-testid="invocation-timeout" type="number" min="0" step="50" @bind="invocationTimeoutMs" />
+                </div>
+                <div>
+                    <label for="slow-duration">Slow duration (ms)</label>
+                    <input id="slow-duration" data-testid="slow-duration" type="number" min="1" step="100" @bind="slowDurationMs" />
+                </div>
+            </div>
+            <label class="check-row" for="explicit-timeout">
+                <input id="explicit-timeout" data-testid="explicit-timeout" type="checkbox" @bind="useExplicitTimeout" />
+                Use the timeout field (unchecked uses the API's 60-second default)
+            </label>
+            <div class="button-row">
+                <button class="btn btn-primary" data-testid="invoke" @onclick="InvokeSelectedAsync" disabled="@(client is null)">Invoke</button>
+                <button class="btn btn-danger" data-testid="cancel-active" @onclick="CancelActive" disabled="@(activeCancellation is null)">Cancel active</button>
+                <button class="btn btn-outline-primary" data-testid="fresh-call" @onclick="FreshClientAndFastCallAsync">New client + fast call</button>
+            </div>
+        </fieldset>
+    </div>
+
+    <div class="scenario-band">
+        <h2>Scenario actions</h2>
+        <div class="scenario-actions">
+            <button class="btn btn-outline-secondary" data-testid="cancel-completed" @onclick="CancelCompletedCallAsync">Cancel completed call</button>
+            <button class="btn btn-outline-secondary" data-testid="pre-cancel-call" @onclick="InvokeWithPreCancelledTokenAsync" disabled="@(client is null)">Pre-cancel call</button>
+            <button class="btn btn-outline-secondary" data-testid="concurrent-calls" @onclick="RunConcurrentCallsAsync" disabled="@(client is null)">Start 3 concurrent calls</button>
+            <button class="btn btn-outline-secondary" data-testid="concurrent-timeout" @onclick="RunConcurrentTimeoutAsync" disabled="@(client is null)">Timeout 1 of 3 calls</button>
+            <button class="btn btn-outline-secondary" data-testid="dispose-during-call" @onclick="DisposeDuringCallAsync" disabled="@(client is null)">Dispose during call</button>
+            <button class="btn btn-outline-secondary" data-testid="navigate-away" @onclick='() => Navigation.NavigateTo("/counter")'>Navigate away</button>
+            <button class="btn btn-outline-secondary" data-testid="ten-cycles" @onclick="RunTenCyclesAsync">Run 10 cancel/timeout cycles</button>
+        </div>
+        <p class="active-operation" aria-live="polite" data-testid="active-operation">@activeOperation</p>
+    </div>
+
+    <section class="log-band" aria-labelledby="log-heading">
+        <div class="log-heading-row">
+            <div>
+                <h2 id="log-heading">Operation log</h2>
+                <p class="result-summary" aria-live="polite" data-testid="result-summary">@resultSummary</p>
+            </div>
+            <button class="btn btn-sm btn-outline-secondary" data-testid="clear-log" @onclick="ClearLog" disabled="@(entries.Count == 0)">Clear log</button>
+        </div>
+        <div class="table-wrap">
+            <table>
+                <thead>
+                    <tr>
+                        <th scope="col">#</th>
+                        <th scope="col">Action</th>
+                        <th scope="col">Result</th>
+                        <th scope="col">Elapsed</th>
+                        <th scope="col">Details</th>
+                    </tr>
+                </thead>
+                <tbody data-testid="operation-log">
+                    @if (entries.Count == 0)
+                    {
+                        <tr><td colspan="5" class="empty-log">No operations recorded.</td></tr>
+                    }
+                    else
+                    {
+                        @foreach (var entry in entries)
+                        {
+                            <tr data-result="@entry.Result">
+                                <td>@entry.Sequence</td>
+                                <td>@entry.Action</td>
+                                <td><span class="result-pill @entry.Result.ToLowerInvariant()">@entry.Result</span></td>
+                                <td>@entry.ElapsedMs ms</td>
+                                <td class="details">@entry.Details</td>
+                            </tr>
+                        }
+                    }
+                </tbody>
+            </table>
+        </div>
+    </section>
+</section>
+
+@code {
+    private const string FastMethod = "ValidationWorker.WorkerMethods.Fast";
+    private const string SlowMethod = "ValidationWorker.WorkerMethods.SlowAsync";
+    private const string NeverMethod = "ValidationWorker.WorkerMethods.NeverAsync";
+    private const string FailMethod = "ValidationWorker.WorkerMethods.Fail";
+
+    private readonly List<LogEntry> entries = [];
+    private WebWorkerClient? client;
+    private CancellationTokenSource? activeCancellation;
+    private int creationTimeoutMs = 10_000;
+    private int invocationTimeoutMs = 1_000;
+    private int operationSequence;
+    private int slowDurationMs = 4_000;
+    private int sequence;
+    private string selectedMethod = "Slow";
+    private bool useExplicitTimeout = true;
+    private string activeOperation = "Idle";
+    private string resultSummary = "Ready.";
+
+    [Parameter]
+    public string ConfigurationName { get; set; } = "Unspecified host";
+
+    private static string RuntimeLocation => OperatingSystem.IsBrowser() ? "Browser runtime" : "Server runtime";
+
+    private async Task CreateClientAsync()
+    {
+        if (client is not null)
+        {
+            return;
+        }
+
+        using var cancellation = BeginCancellableOperation("Creating worker client");
+        var stopwatch = Stopwatch.StartNew();
+
+        try
+        {
+            client = await WebWorkerClient.CreateAsync(JSRuntime, creationTimeoutMs, cancellationToken: cancellation.Token);
+            AddLog("Create client", "Returned", stopwatch, $"Creation timeout: {creationTimeoutMs} ms.");
+        }
+        catch (OperationCanceledException ex)
+        {
+            AddLog("Create client", "Cancelled", stopwatch, DescribeException(ex));
+        }
+        catch (Exception ex) when (IsTimeout(ex))
+        {
+            AddLog("Create client", "TimedOut", stopwatch, DescribeException(ex));
+        }
+        catch (Exception ex)
+        {
+            AddLog("Create client", "Failed", stopwatch, DescribeException(ex));
+        }
+        finally
+        {
+            EndCancellableOperation(cancellation);
+        }
+    }
+
+    private async Task CreateWithPreCancelledTokenAsync()
+    {
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+        var stopwatch = Stopwatch.StartNew();
+
+        try
+        {
+            var unexpectedClient = await WebWorkerClient.CreateAsync(JSRuntime, creationTimeoutMs, cancellationToken: cancellation.Token);
+            await unexpectedClient.DisposeAsync();
+            AddLog("Pre-cancel creation", "Failed", stopwatch, "Creation unexpectedly returned a client.");
+        }
+        catch (OperationCanceledException ex)
+        {
+            AddLog("Pre-cancel creation", "Cancelled", stopwatch, DescribeException(ex));
+        }
+        catch (Exception ex)
+        {
+            AddLog("Pre-cancel creation", IsTimeout(ex) ? "TimedOut" : "Failed", stopwatch, DescribeException(ex));
+        }
+    }
+
+    private async Task InvokeSelectedAsync()
+    {
+        if (client is null)
+        {
+            return;
+        }
+
+        using var cancellation = BeginCancellableOperation($"Invoking {selectedMethod}");
+        await InvokeAndLogAsync(client, selectedMethod, cancellation.Token, useExplicitTimeout, invocationTimeoutMs);
+        EndCancellableOperation(cancellation);
+    }
+
+    private async Task FreshClientAndFastCallAsync()
+    {
+        await DisposeClientAsync("Replacing client after cancellation or timeout");
+        await CreateClientAsync();
+
+        if (client is not null)
+        {
+            await InvokeAndLogAsync(client, "Fast", CancellationToken.None, true, invocationTimeoutMs);
+        }
+    }
+
+    private async Task CancelCompletedCallAsync()
+    {
+        if (client is null)
+        {
+            await CreateClientAsync();
+        }
+
+        if (client is null)
+        {
+            return;
+        }
+
+        using var cancellation = new CancellationTokenSource();
+        var outcome = await InvokeAndLogAsync(client, "Fast", cancellation.Token, true, invocationTimeoutMs);
+        var stopwatch = Stopwatch.StartNew();
+        cancellation.Cancel();
+        AddLog("Cancel token after completion", outcome == "Returned" ? "Returned" : "Failed", stopwatch,
+            $"Original completed outcome remained '{outcome}'.");
+    }
+
+    private async Task InvokeWithPreCancelledTokenAsync()
+    {
+        if (client is null)
+        {
+            return;
+        }
+
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+        await InvokeAndLogAsync(client, "Slow", cancellation.Token, true, invocationTimeoutMs);
+    }
+
+    private async Task RunConcurrentCallsAsync()
+    {
+        if (client is null)
+        {
+            return;
+        }
+
+        using var cancellation = BeginCancellableOperation("Three calls running; Cancel active targets call B");
+        var targetClient = client;
+        var first = InvokeAndLogAsync(targetClient, "Slow", CancellationToken.None, true, slowDurationMs + 4_000, "Concurrent A", slowDurationMs);
+        var second = InvokeAndLogAsync(targetClient, "Slow", cancellation.Token, true, slowDurationMs + 4_000, "Concurrent B", slowDurationMs + 500);
+        var third = InvokeAndLogAsync(targetClient, "Slow", CancellationToken.None, true, slowDurationMs + 4_000, "Concurrent C", slowDurationMs + 1_000);
+
+        await Task.WhenAll(first, second, third);
+        EndCancellableOperation(cancellation);
+    }
+
+    private async Task RunConcurrentTimeoutAsync()
+    {
+        if (client is null)
+        {
+            return;
+        }
+
+        activeOperation = "Three calls running; only call B has a short timeout";
+        var targetClient = client;
+        var peerTimeoutMs = slowDurationMs + 4_000;
+        var shortTimeoutMs = Math.Max(50, Math.Min(250, slowDurationMs / 4));
+        var first = InvokeAndLogAsync(targetClient, "Slow", CancellationToken.None, true, peerTimeoutMs,
+            "Concurrent timeout A", slowDurationMs);
+        var second = InvokeAndLogAsync(targetClient, "Slow", CancellationToken.None, true, shortTimeoutMs,
+            "Concurrent timeout B", slowDurationMs + 500);
+        var third = InvokeAndLogAsync(targetClient, "Slow", CancellationToken.None, true, peerTimeoutMs,
+            "Concurrent timeout C", slowDurationMs + 1_000);
+
+        await Task.WhenAll(first, second, third);
+        activeOperation = "Idle";
+    }
+
+    private async Task DisposeDuringCallAsync()
+    {
+        if (client is null)
+        {
+            return;
+        }
+
+        var targetClient = client;
+        var call = InvokeAndLogAsync(targetClient, "Never", CancellationToken.None, true, invocationTimeoutMs,
+            "Never call disposed before timeout");
+        await Task.Delay(Math.Max(1, invocationTimeoutMs / 2));
+        await DisposeClientAsync("Disposal while invocation is pending");
+        await call;
+    }
+
+    private async Task RunTenCyclesAsync()
+    {
+        await DisposeClientAsync("Preparing repeated-cycle run");
+        activeOperation = "Running 10 alternating cancellation and timeout cycles";
+
+        for (var cycle = 1; cycle <= 10; cycle++)
+        {
+            WebWorkerClient? cycleClient = null;
+            try
+            {
+                cycleClient = await WebWorkerClient.CreateAsync(JSRuntime, creationTimeoutMs);
+                using var cancellation = new CancellationTokenSource();
+                var isCancellationCycle = cycle % 2 == 1;
+                if (isCancellationCycle)
+                {
+                    cancellation.CancelAfter(75);
+                }
+
+                await InvokeAndLogAsync(
+                    cycleClient,
+                    "Slow",
+                    cancellation.Token,
+                    true,
+                    isCancellationCycle ? 5_000 : 75,
+                    $"Cycle {cycle} {(isCancellationCycle ? "cancel" : "timeout")}",
+                    2_000);
+            }
+            catch (Exception ex)
+            {
+                AddLog($"Cycle {cycle} setup", IsTimeout(ex) ? "TimedOut" : "Failed", Stopwatch.StartNew(), DescribeException(ex));
+            }
+            finally
+            {
+                if (cycleClient is not null)
+                {
+                    await cycleClient.DisposeAsync();
+                }
+            }
+        }
+
+        activeOperation = "Cycle run complete; creating a fresh client";
+        await FreshClientAndFastCallAsync();
+        activeOperation = "Idle";
+    }
+
+    private async Task<string> InvokeAndLogAsync(
+        WebWorkerClient targetClient,
+        string methodChoice,
+        CancellationToken cancellationToken,
+        bool explicitTimeout,
+        int timeoutMs,
+        string? action = null,
+        int? durationOverrideMs = null)
+    {
+        var operationId = $"{ConfigurationName}-{Interlocked.Increment(ref operationSequence)}";
+        var (method, args) = BuildInvocation(methodChoice, operationId, durationOverrideMs);
+        var stopwatch = Stopwatch.StartNew();
+        action ??= $"Invoke {methodChoice}";
+
+        try
+        {
+            var result = explicitTimeout
+                ? await targetClient.InvokeAsync<string>(method, args, timeoutMs, cancellationToken)
+                : await targetClient.InvokeAsync<string>(method, args, cancellationToken: cancellationToken);
+            AddLog(action, "Returned", stopwatch, result);
+            return "Returned";
+        }
+        catch (OperationCanceledException ex)
+        {
+            AddLog(action, "Cancelled", stopwatch, DescribeException(ex));
+            return "Cancelled";
+        }
+        catch (Exception ex) when (IsTimeout(ex))
+        {
+            AddLog(action, "TimedOut", stopwatch, DescribeException(ex));
+            return "TimedOut";
+        }
+        catch (Exception ex)
+        {
+            AddLog(action, "Failed", stopwatch, DescribeException(ex));
+            return "Failed";
+        }
+    }
+
+    private (string Method, object[] Args) BuildInvocation(string methodChoice, string operationId, int? durationOverrideMs)
+    {
+        return methodChoice switch
+        {
+            "Fast" => (FastMethod, [operationId]),
+            "Slow" => (SlowMethod, [durationOverrideMs ?? slowDurationMs, operationId]),
+            "Never" => (NeverMethod, [operationId]),
+            "Fail" => (FailMethod, [operationId]),
+            _ => throw new InvalidOperationException($"Unknown method selection '{methodChoice}'.")
+        };
+    }
+
+    private CancellationTokenSource BeginCancellableOperation(string description)
+    {
+        activeCancellation?.Dispose();
+        activeCancellation = new CancellationTokenSource();
+        activeOperation = description;
+        return activeCancellation;
+    }
+
+    private void EndCancellableOperation(CancellationTokenSource cancellation)
+    {
+        if (ReferenceEquals(activeCancellation, cancellation))
+        {
+            activeCancellation = null;
+            activeOperation = "Idle";
+        }
+    }
+
+    private void CancelActive()
+    {
+        if (activeCancellation is null)
+        {
+            return;
+        }
+
+        resultSummary = "Cancellation requested; waiting for the active call to return control.";
+        activeCancellation.Cancel();
+    }
+
+    private async Task DisposeClientAsync(string reason)
+    {
+        if (client is null)
+        {
+            return;
+        }
+
+        var stopwatch = Stopwatch.StartNew();
+        var clientToDispose = client;
+        client = null;
+
+        try
+        {
+            await clientToDispose.DisposeAsync();
+            AddLog("Dispose client", "Returned", stopwatch, reason);
+        }
+        catch (Exception ex)
+        {
+            AddLog("Dispose client", "Failed", stopwatch, DescribeException(ex));
+        }
+    }
+
+    private void AddLog(string action, string result, Stopwatch stopwatch, string details)
+    {
+        stopwatch.Stop();
+        entries.Insert(0, new LogEntry(++sequence, action, result, stopwatch.ElapsedMilliseconds, details));
+        resultSummary = $"{action}: {result} in {stopwatch.ElapsedMilliseconds} ms.";
+        _ = InvokeAsync(StateHasChanged);
+    }
+
+    private void ClearLog()
+    {
+        entries.Clear();
+        resultSummary = "Log cleared.";
+    }
+
+    private static bool IsTimeout(Exception exception)
+    {
+        for (var current = exception; current is not null; current = current.InnerException)
+        {
+            if (current.Message.Contains("timed out", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static string DescribeException(Exception exception)
+    {
+        var parts = new List<string>();
+        for (var current = exception; current is not null; current = current.InnerException)
+        {
+            parts.Add($"{current.GetType().Name}: {current.Message}");
+        }
+
+        return string.Join(" -> ", parts);
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        activeCancellation?.Cancel();
+        activeCancellation?.Dispose();
+        activeCancellation = null;
+
+        if (client is not null)
+        {
+            var clientToDispose = client;
+            client = null;
+            await clientToDispose.DisposeAsync();
+        }
+    }
+
+    private sealed record LogEntry(int Sequence, string Action, string Result, long ElapsedMs, string Details);
+}

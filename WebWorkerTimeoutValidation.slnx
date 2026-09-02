@@ -1,0 +1,7 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/ValidationStandalone/ValidationStandalone.csproj" />
+    <Project Path="src/ValidationWorker/ValidationWorker.csproj" />
+    <Project Path="src/ValidationWebApp/ValidationWebApp/ValidationWebApp.csproj" />
+  </Folder>
+</Solution>
