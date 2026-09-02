@@ -1,24 +1,31 @@
+const activeWorkers = new Set();
+
 function withTimeout(promise, timeoutMs, timeoutMessage) {
-    const timeout = new Promise((_, reject) =>
-        setTimeout(() => reject(new Error(timeoutMessage)), timeoutMs));
-    return Promise.race([promise, timeout]);
+    let timeoutId;
+    const timeout = new Promise((_, reject) => {
+        timeoutId = setTimeout(() => reject(new Error(timeoutMessage)), timeoutMs);
+    });
+
+    return Promise.race([promise, timeout]).finally(() => clearTimeout(timeoutId));
 }
 
 class DotnetWebWorkerClient {
     #worker;
+    #initialization;
+    #initializationDelayId;
     #pendingRequests = {};
     #requestId = 0;
 
-    constructor(worker) {
+    constructor(worker, options = {}) {
         this.#worker = worker;
-    }
+        activeWorkers.add(worker);
 
-    static create(initTimeoutMs, options = {}) {
-        const worker = new Worker('_content/ValidationWorker/dotnet-web-worker.js', { type: "module" });
-
-        const initWorker = new Promise((resolve, reject) => {
-            worker.addEventListener('error', (e) =>
-                reject(new Error(e.message || 'Worker encountered an error')));
+        this.#initialization = new Promise((resolve, reject) => {
+            worker.addEventListener('error', (e) => {
+                const error = new Error(e.message || 'Worker encountered an error');
+                reject(error);
+                this.rejectAllPending(error.message);
+            });
             worker.addEventListener('message', function onMessage(e) {
                 if (e.data.type === "ready") {
                     worker.removeEventListener('message', onMessage);
@@ -27,21 +34,30 @@ class DotnetWebWorkerClient {
             });
         });
 
-        const dotnetJsUrl = DotnetWebWorkerClient.#resolveDotnetJsUrl();
-        const assemblyName = options?.assemblyName ?? null;
-        worker.postMessage({ type: 'init', dotnetJsUrl, assemblyName });
+        this.setupMessageHandler();
 
-        return withTimeout(initWorker, initTimeoutMs, 'Worker initialization timed out').then(() => {
-            const client = new DotnetWebWorkerClient(worker);
-            client.#setupMessageHandler();
-            return client;
-        }, err => {
-            worker.terminate();
+        const dotnetJsUrl = DotnetWebWorkerClient.resolveDotnetJsUrl();
+        const assemblyName = options?.assemblyName ?? null;
+        const initializationDelayMs = Math.max(0, options?.initializationDelayMs ?? 0);
+        this.#initializationDelayId = setTimeout(() => {
+            this.#initializationDelayId = null;
+            worker.postMessage({ type: 'init', dotnetJsUrl, assemblyName });
+        }, initializationDelayMs);
+    }
+
+    static create(options = {}) {
+        const worker = new Worker('_content/ValidationWorker/dotnet-web-worker.js', { type: "module" });
+        return new DotnetWebWorkerClient(worker, options);
+    }
+
+    initialize(initTimeoutMs) {
+        return withTimeout(this.#initialization, initTimeoutMs, 'Worker initialization timed out').catch(err => {
+            this.terminate();
             throw err;
         });
     }
 
-    static #resolveDotnetJsUrl() {
+    static resolveDotnetJsUrl() {
         // Resolve using the browser's import map (handles fingerprinted URLs in published apps).
         // Workers don't inherit the page's import map, so we resolve on the main thread and pass the URL.
         const dotnetJsUrl = new URL('_framework/dotnet.js', document.baseURI).href;
@@ -49,14 +65,13 @@ class DotnetWebWorkerClient {
     }
 
     invoke(method, args, timeoutMs) {
+        const id = ++this.#requestId;
         const invoke = new Promise((resolve, reject) => {
-            const id = ++this.#requestId;
             this.#pendingRequests[id] = { resolve, reject };
             this.#worker.postMessage({ method, args, requestId: id });
         });
 
         return withTimeout(invoke, timeoutMs, `Worker method '${method}' timed out`).catch(err => {
-            const id = this.#requestId;
             if (this.#pendingRequests[id]) {
                 delete this.#pendingRequests[id];
             }
@@ -65,12 +80,21 @@ class DotnetWebWorkerClient {
     }
 
     terminate() {
-        this.#rejectAllPending("Worker terminated");
-        this.#worker?.terminate();
+        this.rejectAllPending("Worker terminated");
+        if (this.#initializationDelayId !== null) {
+            clearTimeout(this.#initializationDelayId);
+            this.#initializationDelayId = null;
+        }
+
+        if (this.#worker) {
+            this.#worker.terminate();
+            activeWorkers.delete(this.#worker);
+        }
+
         this.#worker = null;
     }
 
-    #setupMessageHandler() {
+    setupMessageHandler() {
         this.#worker.addEventListener('message', (e) => {
             if (e.data.type === "result") {
                 const request = this.#pendingRequests[e.data.requestId];
@@ -85,12 +109,9 @@ class DotnetWebWorkerClient {
             }
         });
 
-        this.#worker.addEventListener('error', (e) => {
-            this.#rejectAllPending(e.message || 'Worker error');
-        });
     }
 
-    #rejectAllPending(errorMessage) {
+    rejectAllPending(errorMessage) {
         for (const id in this.#pendingRequests) {
             this.#pendingRequests[id].reject(new Error(errorMessage));
             delete this.#pendingRequests[id];
@@ -98,6 +119,10 @@ class DotnetWebWorkerClient {
     }
 }
 
-export function create(initTimeoutMs, options) {
-    return DotnetWebWorkerClient.create(initTimeoutMs, options);
+export function create(options) {
+    return DotnetWebWorkerClient.create(options);
+}
+
+export function getActiveWorkerCount() {
+    return activeWorkers.size;
 }

@@ -68,11 +68,12 @@
         <div class="scenario-actions">
             <button class="btn btn-outline-secondary" data-testid="cancel-completed" @onclick="CancelCompletedCallAsync">Cancel completed call</button>
             <button class="btn btn-outline-secondary" data-testid="pre-cancel-call" @onclick="InvokeWithPreCancelledTokenAsync" disabled="@(client is null)">Pre-cancel call</button>
-            <button class="btn btn-outline-secondary" data-testid="concurrent-calls" @onclick="RunConcurrentCallsAsync" disabled="@(client is null)">Start 3 concurrent calls</button>
+            <button class="btn btn-outline-secondary" data-testid="concurrent-calls" @onclick="RunConcurrentCallsAsync" disabled="@(client is null)">Cancel 1 of 3 calls</button>
             <button class="btn btn-outline-secondary" data-testid="concurrent-timeout" @onclick="RunConcurrentTimeoutAsync" disabled="@(client is null)">Timeout 1 of 3 calls</button>
             <button class="btn btn-outline-secondary" data-testid="dispose-during-call" @onclick="DisposeDuringCallAsync" disabled="@(client is null)">Dispose during call</button>
             <button class="btn btn-outline-secondary" data-testid="navigate-away" @onclick='() => Navigation.NavigateTo("/counter")'>Navigate away</button>
             <button class="btn btn-outline-secondary" data-testid="ten-cycles" @onclick="RunTenCyclesAsync">Run 10 cancel/timeout cycles</button>
+            <button class="btn btn-outline-secondary" data-testid="ten-creation-cancellations" @onclick="RunTenCreationCancellationsAsync">Cancel creation 10 times</button>
         </div>
         <p class="active-operation" aria-live="polite" data-testid="active-operation">@activeOperation</p>
     </div>
@@ -261,13 +262,18 @@
             return;
         }
 
-        using var cancellation = BeginCancellableOperation("Three calls running; Cancel active targets call B");
+        using var cancellation = BeginCancellableOperation("Three calls running; call B auto-cancels after 75 ms");
         var targetClient = client;
         var first = InvokeAndLogAsync(targetClient, "Slow", CancellationToken.None, true, slowDurationMs + 4_000, "Concurrent A", slowDurationMs);
         var second = InvokeAndLogAsync(targetClient, "Slow", cancellation.Token, true, slowDurationMs + 4_000, "Concurrent B", slowDurationMs + 500);
         var third = InvokeAndLogAsync(targetClient, "Slow", CancellationToken.None, true, slowDurationMs + 4_000, "Concurrent C", slowDurationMs + 1_000);
+        cancellation.CancelAfter(75);
 
-        await Task.WhenAll(first, second, third);
+        var outcomes = await Task.WhenAll(first, second, third);
+        AddAssertion(
+            "Concurrent cancellation isolation",
+            outcomes is ["Returned", "Cancelled", "Returned"],
+            $"Expected Returned/Cancelled/Returned; actual {string.Join('/', outcomes)}.");
         EndCancellableOperation(cancellation);
     }
 
@@ -289,7 +295,11 @@
         var third = InvokeAndLogAsync(targetClient, "Slow", CancellationToken.None, true, peerTimeoutMs,
             "Concurrent timeout C", slowDurationMs + 1_000);
 
-        await Task.WhenAll(first, second, third);
+        var outcomes = await Task.WhenAll(first, second, third);
+        AddAssertion(
+            "Concurrent timeout isolation",
+            outcomes is ["Returned", "TimedOut", "Returned"],
+            $"Expected Returned/TimedOut/Returned; actual {string.Join('/', outcomes)}.");
         activeOperation = "Idle";
     }
 
@@ -350,6 +360,55 @@
 
         activeOperation = "Cycle run complete; creating a fresh client";
         await FreshClientAndFastCallAsync();
+        activeOperation = "Idle";
+    }
+
+    private async Task RunTenCreationCancellationsAsync()
+    {
+        await DisposeClientAsync("Preparing creation-cancellation leak check");
+        activeOperation = "Cancelling 10 partially initialized workers";
+        var baselineCount = await WebWorkerClient.GetActiveWorkerCountAsync(JSRuntime);
+        var allPassed = true;
+
+        for (var cycle = 1; cycle <= 10; cycle++)
+        {
+            using var cancellation = new CancellationTokenSource(25);
+            var stopwatch = Stopwatch.StartNew();
+            var cancelled = false;
+            string? unexpectedFailure = null;
+
+            try
+            {
+                var unexpectedClient = await WebWorkerClient.CreateAsync(
+                    JSRuntime,
+                    creationTimeoutMs,
+                    cancellationToken: cancellation.Token,
+                    initializationDelayMs: 500);
+                await unexpectedClient.DisposeAsync();
+            }
+            catch (OperationCanceledException)
+            {
+                cancelled = true;
+            }
+            catch (Exception ex)
+            {
+                unexpectedFailure = DescribeException(ex);
+            }
+
+            var afterCount = await WebWorkerClient.GetActiveWorkerCountAsync(JSRuntime);
+            var passed = cancelled && afterCount == baselineCount;
+            allPassed &= passed;
+            AddLog(
+                $"Creation cancel cycle {cycle}",
+                passed ? "Returned" : "Failed",
+                stopwatch,
+                $"Assertion {(passed ? "passed" : "failed")}: cancelled={cancelled}; workers before={baselineCount}; workers after={afterCount}. {unexpectedFailure}");
+        }
+
+        AddAssertion(
+            "Creation cancellation cleanup (10 cycles)",
+            allPassed,
+            $"Expected every cancellation to restore active worker count to baseline {baselineCount}.");
         activeOperation = "Idle";
     }
 
@@ -460,6 +519,12 @@
         entries.Insert(0, new LogEntry(++sequence, action, result, stopwatch.ElapsedMilliseconds, details));
         resultSummary = $"{action}: {result} in {stopwatch.ElapsedMilliseconds} ms.";
         _ = InvokeAsync(StateHasChanged);
+    }
+
+    private void AddAssertion(string action, bool passed, string details)
+    {
+        AddLog(action, passed ? "Returned" : "Failed", Stopwatch.StartNew(),
+            $"Assertion {(passed ? "passed" : "failed")}. {details}");
     }
 
     private void ClearLog()
