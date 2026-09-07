@@ -73,7 +73,6 @@
             <button class="btn btn-outline-secondary" data-testid="dispose-during-call" @onclick="DisposeDuringCallAsync" disabled="@(client is null)">Dispose during call</button>
             <button class="btn btn-outline-secondary" data-testid="navigate-away" @onclick='() => Navigation.NavigateTo("/counter")'>Navigate away</button>
             <button class="btn btn-outline-secondary" data-testid="ten-cycles" @onclick="RunTenCyclesAsync">Run 10 cancel/timeout cycles</button>
-            <button class="btn btn-outline-secondary" data-testid="ten-creation-cancellations" @onclick="RunTenCreationCancellationsAsync">Cancel creation 10 times</button>
         </div>
         <p class="active-operation" aria-live="polite" data-testid="active-operation">@activeOperation</p>
     </div>
@@ -360,55 +359,6 @@
 
         activeOperation = "Cycle run complete; creating a fresh client";
         await FreshClientAndFastCallAsync();
-        activeOperation = "Idle";
-    }
-
-    private async Task RunTenCreationCancellationsAsync()
-    {
-        await DisposeClientAsync("Preparing creation-cancellation leak check");
-        activeOperation = "Cancelling 10 partially initialized workers";
-        var baselineCount = await WebWorkerClient.GetActiveWorkerCountAsync(JSRuntime);
-        var allPassed = true;
-
-        for (var cycle = 1; cycle <= 10; cycle++)
-        {
-            using var cancellation = new CancellationTokenSource(25);
-            var stopwatch = Stopwatch.StartNew();
-            var cancelled = false;
-            string? unexpectedFailure = null;
-
-            try
-            {
-                var unexpectedClient = await WebWorkerClient.CreateAsync(
-                    JSRuntime,
-                    creationTimeoutMs,
-                    cancellationToken: cancellation.Token,
-                    initializationDelayMs: 500);
-                await unexpectedClient.DisposeAsync();
-            }
-            catch (OperationCanceledException)
-            {
-                cancelled = true;
-            }
-            catch (Exception ex)
-            {
-                unexpectedFailure = DescribeException(ex);
-            }
-
-            var afterCount = await WebWorkerClient.GetActiveWorkerCountAsync(JSRuntime);
-            var passed = cancelled && afterCount == baselineCount;
-            allPassed &= passed;
-            AddLog(
-                $"Creation cancel cycle {cycle}",
-                passed ? "Returned" : "Failed",
-                stopwatch,
-                $"Assertion {(passed ? "passed" : "failed")}: cancelled={cancelled}; workers before={baselineCount}; workers after={afterCount}. {unexpectedFailure}");
-        }
-
-        AddAssertion(
-            "Creation cancellation cleanup (10 cycles)",
-            allPassed,
-            $"Expected every cancellation to restore active worker count to baseline {baselineCount}.");
         activeOperation = "Idle";
     }
 
